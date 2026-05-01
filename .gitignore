@@ -1,0 +1,19 @@
+# build output
+build/
+
+# wifi credentials - DO NOT commit
+src/secrets.h
+
+# ide / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# compiled binaries
+*.uf2
+*.elf
+*.bin
+*.hex
+*.dis
+*.map
