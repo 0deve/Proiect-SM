@@ -9,7 +9,7 @@
 #define SSD1306_WIDTH  128
 #define SSD1306_HEIGHT 64
 
-// Adresa I2C default a SSD1306 (0x3C este cea mai comuna)
+// Adresa I2C default a SSD1306
 #define SSD1306_I2C_ADDR 0x3C
 
 // Structura pentru display
@@ -19,7 +19,7 @@ typedef struct {
 } ssd1306_t;
 
 // Initializare display OLED
-// i2c: instanta I2C (i2c0 sau i2c1)
+// i2c: instanta I2C
 // sda_pin: GPIO pin pentru SDA
 // scl_pin: GPIO pin pentru SCL
 void ssd1306_init(ssd1306_t *disp, i2c_inst_t *i2c, uint sda_pin, uint scl_pin);
