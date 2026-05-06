@@ -1,7 +1,10 @@
 #include <stdio.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "ds18b20.h"
+#include "ssd1306.h"
+#include "hardware/adc.h"
 
 // Pinii hardware
 #define LED_PIN_AUTO  17
@@ -10,14 +13,65 @@
 #define BTN_RELAY_PIN 19  // Porneste/opreste releul (doar in modul manual)
 #define RELAY_PIN     16
 #define DS18B20_PIN   15
+#define LIGHT_PIN     26  // KY-018 senzor lumina (ADC0)
 
-// Pragul de temperatura se poate schimba dinamic
-volatile float temp_threshold=23.0f;
+// Pini I2C pentru OLED SSD1306
+#define OLED_SDA_PIN  4
+#define OLED_SCL_PIN  5
+
+// Praguri configurabile (se pot schimba din aplicatie)
+volatile float temp_threshold_day   = 25.0f;  // Temperatura de pornire releu ZIUA
+volatile float temp_threshold_night = 20.0f;  // Temperatura de pornire releu NOAPTEA
+volatile uint16_t light_threshold   = 50;     // Peste 50 = intuneric (noapte), sub 50 = lumina (zi)
 
 volatile bool auto_mode = false;      
 volatile bool relay_state = false;
 volatile float ultima_temperatura = 0.0f;
 volatile bool temperatura_valida = false;
+volatile uint16_t ultima_lumina = 0;         // Ultima valoare citita de la senzorul de lumina
+volatile bool is_daytime = true;             // true = zi, false = noapte
+
+// Display OLED global
+ssd1306_t oled;
+
+// Actualizeaza display-ul OLED cu modul curent
+void oled_update_display() {
+    ssd1306_clear(&oled);
+
+    // Chenar decorativ
+    ssd1306_rect(&oled, 0, 0, 128, 64, true);
+
+    // Titlu centrat ("Smart Home" ~ 10 caractere * 6px = 60px, centrat la (34, 4))
+    ssd1306_string(&oled, 34, 4, "Smart Home");
+
+    // Linie separatoare sub titlu
+    ssd1306_hline(&oled, 4, 14, 120, true);
+
+    // Modul curent
+    if (auto_mode) {
+        ssd1306_string(&oled, 16, 24, "Modul: AUTO");
+    } else {
+        ssd1306_string(&oled, 16, 24, "Modul: MANUAL");
+    }
+
+    // Linie separatoare
+    ssd1306_hline(&oled, 4, 38, 120, true);
+
+    // Temperatura si praguri
+    if (auto_mode && temperatura_valida) {
+        char temp_buf[32];
+        snprintf(temp_buf, sizeof(temp_buf), "T: %.1f C", ultima_temperatura);
+        ssd1306_string(&oled, 4, 42, temp_buf);
+
+        char thr_buf[32];
+        snprintf(thr_buf, sizeof(thr_buf), "TRD:%.0f TRN:%.0f", temp_threshold_day, temp_threshold_night);
+        ssd1306_string(&oled, 4, 54, thr_buf);
+    } else {
+        ssd1306_string(&oled, 16, 46, "Temp: OFF");
+    }
+
+    ssd1306_render(&oled);
+}
 
 float change_temp(float temp){
     if(temp==30.0){
@@ -30,39 +84,56 @@ float change_temp(float temp){
     return temp;
 }
 
+// Controlul automat al releului: porneste/opreste pe baza temperaturii si a pragului activ
+void auto_relay_control(float temp, float threshold) {
+    if (temp > threshold && !relay_state) {
+        relay_state = true;
+        gpio_put(RELAY_PIN, 0); // LOW = pornit (Active-LOW)
+        printf("AUTOMAT: Temperatura %.1f > %.1f°C -> Releu ON\n", temp, threshold);
+    }
+    else if (temp <= threshold && relay_state) {
+        relay_state = false;
+        gpio_put(RELAY_PIN, 1); // HIGH = oprit (Active-LOW)
+        printf("AUTOMAT: Temperatura %.1f <= %.1f°C -> Releu OFF\n", temp, threshold);
+    }
+}
+
 // Core 1 ruleaza citirea de temperatura separat de input-ul butoanelor
 void core1_temperature_task() {
     ds18b20_init(DS18B20_PIN);
 
     while (true) {
+        // Citim senzorul de lumina (ADC0) indiferent de mod
+        adc_select_input(0);
+        uint16_t light_raw = adc_read();
+        ultima_lumina = light_raw;
+        is_daytime = (light_raw < light_threshold);
+        printf("[LUMINA] ADC: %u -> %s\n", light_raw, is_daytime ? "ZI" : "NOAPTE");
+
         if (!auto_mode) {
-            sleep_ms(100); // In modul manual, doar asteptam
+            sleep_ms(2000); // In modul manual, citim lumina la 2s
             continue;
         }
+
+        // Selectam pragul de temperatura activ in functie de zi/noapte
+        float active_threshold = is_daytime ? temp_threshold_day : temp_threshold_night;
 
         float temp;
         if (ds18b20_read_temperature(DS18B20_PIN, &temp)) {
             ultima_temperatura = temp;
             temperatura_valida = true;
-            printf("Temperatura: %.2f °C\n", temp);
+            printf("Temp: %.2f °C | Lumina: %u (%s) | Prag activ: %.1f°C\n",
+                   temp, light_raw, is_daytime ? "ZI" : "NOAPTE", active_threshold);
+            oled_update_display();
 
-            // Controlul automat al releului pe baza temperaturii
-            if (temp > temp_threshold && !relay_state) {
-                relay_state = true;
-                gpio_put(RELAY_PIN, 0); // LOW = pornit (Active-LOW)
-                printf("AUTOMAT: Temperatura > %.1f°C -> Releu ON\n", temp_threshold);
-            }
-            else if (temp <= temp_threshold && relay_state) {
-                relay_state = false;
-                gpio_put(RELAY_PIN, 1); // HIGH = oprit (Active-LOW)
-                printf("AUTOMAT: Temperatura <= %.1f°C -> Releu OFF\n", temp_threshold);
-            }
+            // Controlul automat al releului cu pragul selectat
+            auto_relay_control(temp, active_threshold);
         } else {
             temperatura_valida = false;
             printf("EROARE: Senzorul DS18B20 nu raspunde!\n");
         }
 
-        // Pauza de 2 secunde intre citiri pentru a rezolva bug-ul blocarii microprocesorului la schimbari rapide intre moduri
+        // Pauza de 2 secunde intre citiri
         for (int i = 0; i < 20 && auto_mode; i++) {
             sleep_ms(100); 
         }
@@ -99,12 +170,25 @@ int main() {
 
     printf("=== Sistem pornit! Mod: MANUAL ===\n");
     printf("Releu: GP%d | Btn Mode: GP%d | Btn Releu: GP%d\n", RELAY_PIN, BTN_MODE_PIN, BTN_RELAY_PIN);
-    printf("Senzor DS18B20: GP%d | Prag temperatura: %.1f°C\n", DS18B20_PIN, temp_threshold);
+    printf("Senzor DS18B20: GP%d\n", DS18B20_PIN);
+    printf("Prag zi: %.1f°C | Prag noapte: %.1f°C | Prag lumina: %u\n",
+           temp_threshold_day, temp_threshold_night, light_threshold);
+
+    // Initializare ADC pentru senzorul de lumina KY-018 (GPIO 26 = ADC0)
+    adc_init();
+    adc_gpio_init(LIGHT_PIN);
+    adc_select_input(0);  // ADC0 = GPIO 26
+    printf("Senzor lumina KY-018: GP%d (ADC0)\n", LIGHT_PIN);
+
+    // Initializare OLED pe I2C0
+    ssd1306_init(&oled, i2c0, OLED_SDA_PIN, OLED_SCL_PIN);
+    printf("OLED SSD1306 initializat pe SDA=GP%d, SCL=GP%d\n", OLED_SDA_PIN, OLED_SCL_PIN);
 
     // led intial
     gpio_put(LED_PIN_MANUAL, 1);
 
-    printf("Astept apasari...\n");
+    // Afisam starea initiala pe OLED
+    oled_update_display();
 
     multicore_launch_core1(core1_temperature_task);
     printf("Core 1 lansat: asteapta modul AUTO.\n");
@@ -131,6 +215,9 @@ int main() {
                     temperatura_valida = false;
                 }
 
+                // Actualizam OLED-ul cu noul mod
+                oled_update_display();
+
                 // Asteptam eliberarea butonului
                 while (!gpio_get(BTN_MODE_PIN)) {
                     sleep_ms(10);
@@ -151,9 +238,17 @@ int main() {
                         gpio_put(RELAY_PIN, 1); // Active-LOW: 1 = relay OFF
                     }
                     printf("BTN_RELAY: apasat -> Releu = %s (manual)\n", relay_state ? "ON" : "OFF");
+                    oled_update_display(); // Actualizam status releu pe OLED
                 } else {
-                    temp_threshold = change_temp(temp_threshold);
-                    printf("THRESHOLD: schimbat -> %.1f°C\n", temp_threshold);
+                    // In modul auto, butonul schimba threshold-ul activ (zi sau noapte)
+                    if (is_daytime) {
+                        temp_threshold_day = change_temp(temp_threshold_day);
+                        printf("THRESHOLD ZI: schimbat -> %.1f°C\n", temp_threshold_day);
+                    } else {
+                        temp_threshold_night = change_temp(temp_threshold_night);
+                        printf("THRESHOLD NOAPTE: schimbat -> %.1f°C\n", temp_threshold_night);
+                    }
+                    oled_update_display();
                 }
 
                 // Asteptam eliberarea butonului
