@@ -3,6 +3,7 @@ add_executable(smart_home_gateway
     main.c
     ds18b20.c
     ssd1306.c
+    wifi_server.c
 )
 
 # includem directorul curent (pentru secrets.h)
@@ -16,10 +17,11 @@ target_link_libraries(smart_home_gateway
     pico_multicore              # dual-core (core1 pentru senzor temperatura)
     hardware_gpio               # control gpio (relay, led, butoane)
     hardware_i2c                # comunicatie i2c (oled ssd1306)
-    # pico_cyw43_arch_lwip_poll # wifi + lwip (mod polling, non-blocant)
+    pico_cyw43_arch_lwip_poll          # wifi + lwip poll mode
     hardware_adc                # citire adc (senzor lumina)
     # hardware_dma              # transfer dma (oled framebuffer)
     # hardware_timer            # alarme si timere hardware
+    pico_stdlib
 )
 
 # activam usb serial pentru debug (printf -> usb)

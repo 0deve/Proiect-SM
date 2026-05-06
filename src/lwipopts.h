@@ -16,8 +16,11 @@
 #define LWIP_ICMP                   1
 #define LWIP_DNS                    0
 
+// DHCP tuning for RP2350 + phone hotspots
+#define DHCP_DOES_ARP_CHECK         0       // skip ARP check = faster IP assignment
+
 // dimensiuni buffere
-#define MEM_SIZE                    4000
+#define MEM_SIZE                    8000
 #define MEMP_NUM_TCP_PCB            5
 #define MEMP_NUM_TCP_SEG            16
 #define PBUF_POOL_SIZE              16

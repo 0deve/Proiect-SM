@@ -2,8 +2,10 @@
 #include <string.h>
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
+#include "pico/cyw43_arch.h"
 #include "ds18b20.h"
 #include "ssd1306.h"
+#include "wifi_server.h"
 #include "hardware/adc.h"
 
 // Pinii hardware
@@ -67,9 +69,29 @@ void oled_update_display() {
         snprintf(thr_buf, sizeof(thr_buf), "TRD:%.0f TRN:%.0f", temp_threshold_day, temp_threshold_night);
         ssd1306_string(&oled, 4, 54, thr_buf);
     } else {
-        ssd1306_string(&oled, 16, 46, "Temp: OFF");
+        // In modul manual afisam IP-ul dispozitivului
+        const char *ip = wifi_server_get_ip();
+        if (ip && strcmp(ip, "0.0.0.0") != 0) {
+            ssd1306_string(&oled, 4, 42, "IP:");
+            ssd1306_string(&oled, 4, 54, ip);
+        } else {
+            ssd1306_string(&oled, 16, 46, "WiFi: OFF");
+        }
     }
 
+    ssd1306_render(&oled);
+}
+
+// Ecran special: afisare IP dupa conectare WiFi
+void oled_show_wifi_status(const char *line1, const char *line2) {
+    ssd1306_clear(&oled);
+    ssd1306_rect(&oled, 0, 0, 128, 64, true);
+    ssd1306_string(&oled, 34, 4, "Smart Home");
+    ssd1306_hline(&oled, 4, 14, 120, true);
+    ssd1306_string(&oled, 10, 28, line1);
+    if (line2) {
+        ssd1306_string(&oled, 10, 44, line2);
+    }
     ssd1306_render(&oled);
 }
 
@@ -140,7 +162,7 @@ void core1_temperature_task() {
     }
 }
 
-// Core principal, butoane
+// Core principal, butoane + WiFi
 int main() {
     // configurare releu
     gpio_init(RELAY_PIN);
@@ -187,6 +209,21 @@ int main() {
     // led intial
     gpio_put(LED_PIN_MANUAL, 1);
 
+    // ── Initializare WiFi si server HTTP ──
+    oled_show_wifi_status("Conectare WiFi", "...");
+
+    if (wifi_server_init()) {
+        char ip_msg[32];
+        snprintf(ip_msg, sizeof(ip_msg), "IP: %s", wifi_server_get_ip());
+        oled_show_wifi_status("WiFi conectat!", ip_msg);
+        printf("=== Server HTTP activ pe %s ===\n", wifi_server_get_ip());
+        sleep_ms(3000); // Afisam IP-ul 3 secunde pe OLED
+    } else {
+        oled_show_wifi_status("WiFi EROARE!", "Verificati config");
+        printf("=== EROARE: WiFi nu s-a conectat! ===\n");
+        sleep_ms(3000);
+    }
+
     // Afisam starea initiala pe OLED
     oled_update_display();
 
@@ -194,6 +231,8 @@ int main() {
     printf("Core 1 lansat: asteapta modul AUTO.\n");
 
     while (true) {
+        // Procesam pachetele WiFi
+        wifi_server_poll();
 
         // buton schimbare mod
         if (!gpio_get(BTN_MODE_PIN)) {
@@ -218,8 +257,9 @@ int main() {
                 // Actualizam OLED-ul cu noul mod
                 oled_update_display();
 
-                // Asteptam eliberarea butonului
+                // Asteptam eliberarea butonului (cu WiFi polling)
                 while (!gpio_get(BTN_MODE_PIN)) {
+                    wifi_server_poll();
                     sleep_ms(10);
                 }
                 sleep_ms(50);
@@ -251,8 +291,9 @@ int main() {
                     oled_update_display();
                 }
 
-                // Asteptam eliberarea butonului
+                // Asteptam eliberarea butonului (cu WiFi polling)
                 while (!gpio_get(BTN_RELAY_PIN)) {
+                    wifi_server_poll();
                     sleep_ms(10);
                 }
                 sleep_ms(50);
