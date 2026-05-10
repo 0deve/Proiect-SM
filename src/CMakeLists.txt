@@ -19,9 +19,7 @@ target_link_libraries(smart_home_gateway
     hardware_i2c                # comunicatie i2c (oled ssd1306)
     pico_cyw43_arch_lwip_poll          # wifi + lwip poll mode
     hardware_adc                # citire adc (senzor lumina)
-    # hardware_dma              # transfer dma (oled framebuffer)
-    # hardware_timer            # alarme si timere hardware
-    pico_stdlib
+    pico_sync                   # mutex pentru sincronizare intre core-uri
 )
 
 # activam usb serial pentru debug (printf -> usb)

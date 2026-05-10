@@ -21,7 +21,7 @@
 
 // dimensiuni buffere
 #define MEM_SIZE                    8000
-#define MEMP_NUM_TCP_PCB            5
+#define MEMP_NUM_TCP_PCB            8
 #define MEMP_NUM_TCP_SEG            16
 #define PBUF_POOL_SIZE              16
 #define TCP_MSS                     1460

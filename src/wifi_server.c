@@ -27,19 +27,25 @@ extern volatile bool is_daytime;
 extern volatile float temp_threshold_day;
 extern volatile float temp_threshold_night;
 extern volatile uint16_t light_threshold;
+extern volatile bool oled_needs_update;
+
+extern mutex_t state_mutex;
 
 static char ip_str[16] = "0.0.0.0";
 static struct tcp_pcb *server_pcb = NULL;
 
-// parsare query string
+// parsare query string (cu verificare delimitator pentru a evita false match)
 
 static bool parse_query_int(const char *query, const char *key, int *value) {
     char search[32];
     snprintf(search, sizeof(search), "%s=", key);
     const char *pos = strstr(query, search);
-    if (pos) {
-        *value = atoi(pos + strlen(search));
-        return true;
+    while (pos) {
+        if (pos == query || *(pos - 1) == '&' || *(pos - 1) == '?' || *(pos - 1) == '\n') {
+            *value = atoi(pos + strlen(search));
+            return true;
+        }
+        pos = strstr(pos + 1, search);
     }
     return false;
 }
@@ -48,20 +54,36 @@ static bool parse_query_float(const char *query, const char *key, float *value) 
     char search[32];
     snprintf(search, sizeof(search), "%s=", key);
     const char *pos = strstr(query, search);
-    if (pos) {
-        *value = (float)atof(pos + strlen(search));
-        return true;
+    while (pos) {
+        if (pos == query || *(pos - 1) == '&' || *(pos - 1) == '?' || *(pos - 1) == '\n') {
+            *value = (float)atof(pos + strlen(search));
+            return true;
+        }
+        pos = strstr(pos + 1, search);
     }
     return false;
 }
 
-// trimite raspuns http cu json
+// cauta parametrii in query string SAU in body-ul POST
+static const char* find_params(const char *request) {
+    // intai cautam query string din URL
+    const char *query = strchr(request, '?');
+    if (query) return query;
+    // apoi cautam in body (dupa \r\n\r\n)
+    const char *body = strstr(request, "\r\n\r\n");
+    if (body) return body + 4;
+    return NULL;
+}
+
+// trimite raspuns http cu json (cu CORS headers)
 
 static void send_response(struct tcp_pcb *tpcb, const char *json) {
-    char response[600];
+    char response[800];
     int len = snprintf(response, sizeof(response),
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: application/json\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
         "Connection: close\r\n"
         "Content-Length: %d\r\n"
         "\r\n%s",
@@ -71,10 +93,14 @@ static void send_response(struct tcp_pcb *tpcb, const char *json) {
     tcp_output(tpcb);
 }
 
-// inchide conexiunea dupa trimitere
+// inchide conexiunea dupa trimitere (cu fallback la tcp_abort)
 
 static err_t server_sent_cb(void *arg, struct tcp_pcb *tpcb, u16_t len) {
-    tcp_close(tpcb);
+    err_t err = tcp_close(tpcb);
+    if (err != ERR_OK) {
+        tcp_abort(tpcb);
+        return ERR_ABRT;
+    }
     return ERR_OK;
 }
 
@@ -84,6 +110,7 @@ static void handle_request(struct tcp_pcb *tpcb, const char *request) {
     char json[400];
 
     if (strncmp(request, "GET /status", 11) == 0) {
+        mutex_enter_blocking(&state_mutex);
         snprintf(json, sizeof(json),
             "{\"temperature\":%.1f,\"light\":%u,\"relay\":%s,"
             "\"auto_mode\":%s,\"is_daytime\":%s,"
@@ -97,34 +124,40 @@ static void handle_request(struct tcp_pcb *tpcb, const char *request) {
             temp_threshold_day,
             temp_threshold_night,
             light_threshold);
+        mutex_exit(&state_mutex);
     }
     else if (strncmp(request, "POST /relay", 11) == 0) {
+        mutex_enter_blocking(&state_mutex);
         if (!auto_mode) {
             int state = -1;
-            const char *query = strchr(request, '?');
-            if (query && parse_query_int(query, "state", &state)) {
+            const char *params = find_params(request);
+            if (params && parse_query_int(params, "state", &state)) {
                 relay_state = (state == 1);
                 gpio_put(RELAY_PIN, relay_state ? 0 : 1);
                 printf("[HTTP] Releu -> %s\n", relay_state ? "ON" : "OFF");
                 snprintf(json, sizeof(json),
                     "{\"success\":true,\"state\":%s}",
                     relay_state ? "true" : "false");
+                oled_needs_update = true;
             } else {
                 snprintf(json, sizeof(json), "{\"success\":false,\"error\":\"missing state param\"}");
             }
         } else {
             snprintf(json, sizeof(json), "{\"success\":false,\"error\":\"auto mode active\"}");
         }
+        mutex_exit(&state_mutex);
     }
     else if (strncmp(request, "POST /mode", 10) == 0) {
-        const char *query = strchr(request, '?');
-        if (query && strstr(query, "mode=auto")) {
+        const char *params = find_params(request);
+        mutex_enter_blocking(&state_mutex);
+        if (params && strstr(params, "mode=auto")) {
             auto_mode = true;
             gpio_put(LED_PIN_MANUAL, 0);
             gpio_put(LED_PIN_AUTO, 1);
             printf("[HTTP] Mod -> AUTO\n");
             snprintf(json, sizeof(json), "{\"success\":true,\"mode\":\"auto\"}");
-        } else if (query && strstr(query, "mode=manual")) {
+            oled_needs_update = true;
+        } else if (params && strstr(params, "mode=manual")) {
             auto_mode = false;
             relay_state = false;
             gpio_put(RELAY_PIN, 1);
@@ -133,32 +166,50 @@ static void handle_request(struct tcp_pcb *tpcb, const char *request) {
             temperatura_valida = false;
             printf("[HTTP] Mod -> MANUAL\n");
             snprintf(json, sizeof(json), "{\"success\":true,\"mode\":\"manual\"}");
+            oled_needs_update = true;
         } else {
             snprintf(json, sizeof(json), "{\"success\":false,\"error\":\"invalid mode\"}");
         }
+        mutex_exit(&state_mutex);
     }
     else if (strncmp(request, "POST /threshold", 15) == 0) {
-        const char *query = strchr(request, '?');
-        if (query) {
+        const char *params = find_params(request);
+        mutex_enter_blocking(&state_mutex);
+        if (params) {
             float day_val, night_val;
             int light_val;
-            if (parse_query_float(query, "day", &day_val))
-                temp_threshold_day = day_val;
-            if (parse_query_float(query, "night", &night_val))
-                temp_threshold_night = night_val;
-            if (parse_query_int(query, "light", &light_val))
-                light_threshold = (uint16_t)light_val;
+            if (parse_query_float(params, "day", &day_val))
+                if (day_val >= 5.0f && day_val <= 45.0f) temp_threshold_day = day_val;
+            if (parse_query_float(params, "night", &night_val))
+                if (night_val >= 5.0f && night_val <= 45.0f) temp_threshold_night = night_val;
+            if (parse_query_int(params, "light", &light_val))
+                if (light_val >= 0 && light_val <= 4095) light_threshold = (uint16_t)light_val;
             printf("[HTTP] Praguri -> ZI:%.1f NOAPTE:%.1f LUMINA:%u\n",
                    temp_threshold_day, temp_threshold_night, light_threshold);
             snprintf(json, sizeof(json),
                 "{\"success\":true,\"threshold_day\":%.1f,\"threshold_night\":%.1f,\"light_threshold\":%u}",
                 temp_threshold_day, temp_threshold_night, light_threshold);
+            oled_needs_update = true;
         } else {
             snprintf(json, sizeof(json), "{\"success\":false,\"error\":\"missing params\"}");
         }
+        mutex_exit(&state_mutex);
     }
     else if (strncmp(request, "GET /ping", 9) == 0) {
         snprintf(json, sizeof(json), "{\"alive\":true}");
+    }
+    else if (strncmp(request, "OPTIONS ", 8) == 0) {
+        // raspuns CORS preflight
+        const char *cors =
+            "HTTP/1.1 204 No Content\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n\r\n";
+        tcp_sent(tpcb, server_sent_cb);
+        tcp_write(tpcb, cors, strlen(cors), TCP_WRITE_FLAG_COPY);
+        tcp_output(tpcb);
+        return;
     }
     else {
         snprintf(json, sizeof(json), "{\"error\":\"unknown endpoint\"}");
@@ -176,7 +227,7 @@ static err_t server_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err
         return ERR_OK;
     }
 
-    char request[300];
+    char request[512];
     int len = pbuf_copy_partial(p, request, sizeof(request) - 1, 0);
     request[len] = '\0';
 
@@ -188,10 +239,18 @@ static err_t server_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err
     return ERR_OK;
 }
 
+// callback: eroare pe conexiune (clientul s-a deconectat brusc)
+
+static void server_err_cb(void *arg, err_t err) {
+    printf("[HTTP] Conexiune eroare: %d\n", err);
+    // PCB-ul a fost deja eliberat de lwIP
+}
+
 // callback: conexiune noua acceptata
 
 static err_t server_accept_cb(void *arg, struct tcp_pcb *newpcb, err_t err) {
     tcp_recv(newpcb, server_recv_cb);
+    tcp_err(newpcb, server_err_cb);
     return ERR_OK;
 }
 
@@ -233,55 +292,57 @@ bool wifi_server_init(void) {
     cyw43_wifi_pm(&cyw43_state, cyw43_pm_value(CYW43_NO_POWERSAVE_MODE, 20, 1, 1, 1));
 
     printf("[WIFI] Conectare la '%s'...\n", WIFI_SSID);
+    stdio_flush();
 
     #define WIFI_MAX_RETRIES 3
-    #define WIFI_TIMEOUT_SECONDS 30
+    #define WIFI_TIMEOUT_MS 15000
 
     bool connected = false;
 
     for (int attempt = 1; attempt <= WIFI_MAX_RETRIES && !connected; attempt++) {
         printf("[WIFI] Incercare %d/%d...\n", attempt, WIFI_MAX_RETRIES);
+        stdio_flush();
 
-        cyw43_arch_wifi_connect_async(WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK);
+        // conectare sincrona cu timeout - mult mai stabila pe RP2350
+        int err = cyw43_arch_wifi_connect_timeout_ms(
+            WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK, WIFI_TIMEOUT_MS);
 
-        bool dhcp_restarted = false;
-
-        for (int s = 0; s < WIFI_TIMEOUT_SECONDS * 10 && !connected; s++) {
-            // in poll mode trebuie sa procesam manual evenimentele wifi/lwip
-            for (int p = 0; p < 100; p++) {
-                cyw43_arch_poll();
-                sleep_ms(1);
-            }
-
-            // verificam ip
-            struct netif *nif = netif_list;
-            if (nif != NULL) {
-                const ip4_addr_t *addr = netif_ip4_addr(nif);
+        if (err == 0) {
+            // verificam daca avem IP de la DHCP
+            if (netif_list) {
+                const ip4_addr_t *addr = netif_ip4_addr(netif_list);
                 if (addr && addr->addr != 0) {
                     connected = true;
                     printf("[WIFI] Conectat! IP detectat.\n");
-                    break;
+                    stdio_flush();
                 }
             }
 
-            // restart dhcp dupa 5s
-            if (s == 50 && !dhcp_restarted && netif_list != NULL) {
-                int ws = cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA);
-                if (ws >= CYW43_LINK_JOIN) {
-                    printf("[WIFI] wifi ok dar fara ip - restart dhcp\n");
-                    netif_set_up(netif_list);
-                    netif_set_link_up(netif_list);
-                    dhcp_release_and_stop(netif_list);
-                    for (int p = 0; p < 200; p++) { cyw43_arch_poll(); sleep_ms(1); }
-                    dhcp_start(netif_list);
-                    dhcp_restarted = true;
+            // daca wifi e ok dar nu avem IP, asteptam DHCP inca putin
+            if (!connected) {
+                printf("[WIFI] WiFi asociat, asteptam DHCP...\n");
+                stdio_flush();
+                for (int w = 0; w < 100 && !connected; w++) {
+                    cyw43_arch_poll();
+                    sleep_ms(100);
+                    if (netif_list) {
+                        const ip4_addr_t *addr = netif_ip4_addr(netif_list);
+                        if (addr && addr->addr != 0) {
+                            connected = true;
+                            printf("[WIFI] DHCP OK!\n");
+                            stdio_flush();
+                        }
+                    }
                 }
             }
 
-            // ip static fallback dupa 10s
-            if (s == 100 && !connected && netif_list != NULL) {
-                printf("[WIFI] dhcp esuat - ip static\n");
+            // fallback IP static daca DHCP nu a mers
+            if (!connected && netif_list) {
+                printf("[WIFI] DHCP esuat - setam IP static\n");
+                stdio_flush();
                 dhcp_release_and_stop(netif_list);
+                sleep_ms(100);
+
                 ip4_addr_t ip, mask, gw;
                 IP4_ADDR(&ip, 192, 168, 43, 100);
                 IP4_ADDR(&mask, 255, 255, 255, 0);
@@ -289,39 +350,33 @@ bool wifi_server_init(void) {
                 netif_set_addr(netif_list, &ip, &mask, &gw);
                 netif_set_up(netif_list);
 
+                // polling scurt sa aplice adresa
+                for (int p = 0; p < 10; p++) {
+                    cyw43_arch_poll();
+                    sleep_ms(50);
+                }
+
                 const ip4_addr_t *check = netif_ip4_addr(netif_list);
                 if (check && check->addr != 0) {
                     connected = true;
-                    printf("[WIFI] ip static: %s\n", ip4addr_ntoa(check));
+                    printf("[WIFI] IP static setat: %s\n", ip4addr_ntoa(check));
+                    stdio_flush();
                 }
             }
-
-            // log la fiecare secunda primele 10s, apoi la 2s
-            bool should_log = (s < 100) ? (s % 10 == 0) : (s % 20 == 0);
-            if (should_log) {
-                int ws = cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA);
-                int ts = cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA);
-                printf("[WIFI] t=%ds wifi=%d tcpip=%d netif=%s\n",
-                       s / 10, ws, ts, netif_list ? "ok" : "NULL");
-            }
-
-            if (cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA) < 0) {
-                printf("[WIFI] Eroare fatala wifi\n");
-                break;
-            }
+        } else {
+            printf("[WIFI] Incercarea %d esuata (err=%d)\n", attempt, err);
+            stdio_flush();
         }
 
-        if (!connected) {
-            printf("[WIFI] Incercarea %d esuata.\n", attempt);
-            if (attempt < WIFI_MAX_RETRIES) {
-                cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
-                sleep_ms(2000);
-            }
+        if (!connected && attempt < WIFI_MAX_RETRIES) {
+            cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+            sleep_ms(2000);
         }
     }
 
     if (!connected) {
         printf("[WIFI] Toate incercarile au esuat!\n");
+        stdio_flush();
         return false;
     }
 
@@ -333,6 +388,7 @@ bool wifi_server_init(void) {
     }
 
     printf("[WIFI] Conectat! IP: %s\n", ip_str);
+    stdio_flush();
     return wifi_server_start();
 }
 

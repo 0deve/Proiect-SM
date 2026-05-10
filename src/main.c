@@ -2,6 +2,7 @@
 #include <string.h>
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
+#include "pico/mutex.h"
 #include "pico/cyw43_arch.h"
 #include "ds18b20.h"
 #include "ssd1306.h"
@@ -35,6 +36,12 @@ volatile bool is_daytime = true;             // true = zi, false = noapte
 
 // Display OLED global
 ssd1306_t oled;
+
+// Mutex pentru protejarea variabilelor partajate intre core-uri
+mutex_t state_mutex;
+
+// Flag pentru actualizarea OLED-ului doar din Core 0 (I2C nu e thread-safe)
+volatile bool oled_needs_update = false;
 
 // Actualizeaza display-ul OLED cu modul curent
 void oled_update_display() {
@@ -96,7 +103,7 @@ void oled_show_wifi_status(const char *line1, const char *line2) {
 }
 
 float change_temp(float temp){
-    if(temp==30.0){
+    if(temp>=30.0f){
         temp=10.0f;
     }
     else{
@@ -108,6 +115,7 @@ float change_temp(float temp){
 
 // Controlul automat al releului: porneste/opreste pe baza temperaturii si a pragului activ
 void auto_relay_control(float temp, float threshold) {
+    mutex_enter_blocking(&state_mutex);
     if (temp > threshold && !relay_state) {
         relay_state = true;
         gpio_put(RELAY_PIN, 0); // LOW = pornit (Active-LOW)
@@ -118,6 +126,7 @@ void auto_relay_control(float temp, float threshold) {
         gpio_put(RELAY_PIN, 1); // HIGH = oprit (Active-LOW)
         printf("AUTOMAT: Temperatura %.1f <= %.1f°C -> Releu OFF\n", temp, threshold);
     }
+    mutex_exit(&state_mutex);
 }
 
 // Core 1 ruleaza citirea de temperatura separat de input-ul butoanelor
@@ -128,8 +137,12 @@ void core1_temperature_task() {
         // Citim senzorul de lumina (ADC0) indiferent de mod
         adc_select_input(0);
         uint16_t light_raw = adc_read();
+
+        mutex_enter_blocking(&state_mutex);
         ultima_lumina = light_raw;
         is_daytime = (light_raw < light_threshold);
+        mutex_exit(&state_mutex);
+
         printf("[LUMINA] ADC: %u -> %s\n", light_raw, is_daytime ? "ZI" : "NOAPTE");
 
         if (!auto_mode) {
@@ -142,11 +155,16 @@ void core1_temperature_task() {
 
         float temp;
         if (ds18b20_read_temperature(DS18B20_PIN, &temp)) {
+            mutex_enter_blocking(&state_mutex);
             ultima_temperatura = temp;
             temperatura_valida = true;
+            mutex_exit(&state_mutex);
+
             printf("Temp: %.2f °C | Lumina: %u (%s) | Prag activ: %.1f°C\n",
                    temp, light_raw, is_daytime ? "ZI" : "NOAPTE", active_threshold);
-            oled_update_display();
+
+            // Semnalam Core 0 sa actualizeze OLED-ul (I2C nu e thread-safe)
+            oled_needs_update = true;
 
             // Controlul automat al releului cu pragul selectat
             auto_relay_control(temp, active_threshold);
@@ -209,7 +227,9 @@ int main() {
     // led intial
     gpio_put(LED_PIN_MANUAL, 1);
 
-    // ── Initializare WiFi si server HTTP ──
+    // ── Initializare mutex si WiFi ──
+    mutex_init(&state_mutex);
+
     oled_show_wifi_status("Conectare WiFi", "...");
 
     if (wifi_server_init()) {
@@ -234,10 +254,17 @@ int main() {
         // Procesam pachetele WiFi
         wifi_server_poll();
 
+        // Actualizam OLED-ul din Core 0 cand Core 1 semnaleaza (I2C thread-safe)
+        if (oled_needs_update) {
+            oled_needs_update = false;
+            oled_update_display();
+        }
+
         // buton schimbare mod
         if (!gpio_get(BTN_MODE_PIN)) {
             sleep_ms(50);
             if (!gpio_get(BTN_MODE_PIN)) {
+                mutex_enter_blocking(&state_mutex);
                 auto_mode = !auto_mode;
 
                 if (auto_mode) {
@@ -253,6 +280,7 @@ int main() {
                     gpio_put(RELAY_PIN, 1); // Oprim releul la revenirea in manual
                     temperatura_valida = false;
                 }
+                mutex_exit(&state_mutex);
 
                 // Actualizam OLED-ul cu noul mod
                 oled_update_display();
@@ -270,6 +298,7 @@ int main() {
         if (!gpio_get(BTN_RELAY_PIN)) {
             sleep_ms(50);
             if (!gpio_get(BTN_RELAY_PIN)) {
+                mutex_enter_blocking(&state_mutex);
                 if (!auto_mode) {
                     relay_state = !relay_state;
                     if (relay_state) {
@@ -278,7 +307,6 @@ int main() {
                         gpio_put(RELAY_PIN, 1); // Active-LOW: 1 = relay OFF
                     }
                     printf("BTN_RELAY: apasat -> Releu = %s (manual)\n", relay_state ? "ON" : "OFF");
-                    oled_update_display(); // Actualizam status releu pe OLED
                 } else {
                     // In modul auto, butonul schimba threshold-ul activ (zi sau noapte)
                     if (is_daytime) {
@@ -288,8 +316,11 @@ int main() {
                         temp_threshold_night = change_temp(temp_threshold_night);
                         printf("THRESHOLD NOAPTE: schimbat -> %.1f°C\n", temp_threshold_night);
                     }
-                    oled_update_display();
                 }
+                mutex_exit(&state_mutex);
+
+                // Actualizam OLED-ul dupa schimbarea starii
+                oled_update_display();
 
                 // Asteptam eliberarea butonului (cu WiFi polling)
                 while (!gpio_get(BTN_RELAY_PIN)) {
