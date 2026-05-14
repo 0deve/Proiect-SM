@@ -35,8 +35,17 @@ volatile bool temperatura_valida = false;
 volatile uint16_t ultima_lumina = 0;         // Ultima valoare citita de la senzorul de lumina
 volatile bool is_daytime = true;             // true = zi, false = noapte
 
+// Stocare IP WiFi global pentru afisare pe OLED
+char global_ip_str[20] = "";
+bool wifi_connected = false;
+volatile bool oled_needs_update = false;
+
 // Display OLED global
 ssd1306_t oled;
+
+void trigger_oled_update() {
+    oled_needs_update = true;
+}
 
 // Actualizeaza display-ul OLED cu modul curent
 void oled_update_display() {
@@ -45,8 +54,12 @@ void oled_update_display() {
     // Chenar decorativ
     ssd1306_rect(&oled, 0, 0, 128, 64, true);
 
-    // Titlu centrat ("Smart Home" ~ 10 caractere * 6px = 60px, centrat la (34, 4))
-    ssd1306_string(&oled, 34, 4, "Smart Home");
+    // Titlu centrat sau IP-ul conexiunii
+    if (wifi_connected) {
+        ssd1306_string(&oled, 4, 4, global_ip_str);
+    } else {
+        ssd1306_string(&oled, 34, 4, "Smart Home");
+    }
 
     // Linie separatoare sub titlu
     ssd1306_hline(&oled, 4, 14, 120, true);
@@ -62,16 +75,20 @@ void oled_update_display() {
     ssd1306_hline(&oled, 4, 38, 120, true);
 
     // Temperatura si praguri
-    if (auto_mode && temperatura_valida) {
+    if (temperatura_valida) {
         char temp_buf[32];
         snprintf(temp_buf, sizeof(temp_buf), "T: %.1f C", ultima_temperatura);
         ssd1306_string(&oled, 4, 42, temp_buf);
 
-        char thr_buf[32];
-        snprintf(thr_buf, sizeof(thr_buf), "TRD:%.0f TRN:%.0f", temp_threshold_day, temp_threshold_night);
-        ssd1306_string(&oled, 4, 54, thr_buf);
+        if (auto_mode) {
+            char thr_buf[32];
+            snprintf(thr_buf, sizeof(thr_buf), "TRD:%.0f TRN:%.0f", temp_threshold_day, temp_threshold_night);
+            ssd1306_string(&oled, 4, 54, thr_buf);
+        } else {
+            ssd1306_string(&oled, 4, 54, "Releu manual");
+        }
     } else {
-        ssd1306_string(&oled, 16, 46, "Temp: OFF");
+        ssd1306_string(&oled, 16, 46, "Temp: ERR/OFF");
     }
 
     ssd1306_render(&oled);
@@ -114,11 +131,6 @@ void core1_temperature_task() {
         is_daytime = (light_raw < light_threshold);
         printf("[LUMINA] ADC: %u -> %s\n", light_raw, is_daytime ? "ZI" : "NOAPTE");
 
-        if (!auto_mode) {
-            sleep_ms(2000); // In modul manual, citim lumina la 2s
-            continue;
-        }
-
         // Selectam pragul de temperatura activ in functie de zi/noapte
         float active_threshold = is_daytime ? temp_threshold_day : temp_threshold_night;
 
@@ -128,19 +140,20 @@ void core1_temperature_task() {
             temperatura_valida = true;
             printf("Temp: %.2f °C | Lumina: %u (%s) | Prag activ: %.1f°C\n",
                    temp, light_raw, is_daytime ? "ZI" : "NOAPTE", active_threshold);
-            oled_update_display();
+            oled_needs_update = true;
 
-            // Controlul automat al releului cu pragul selectat
-            auto_relay_control(temp, active_threshold);
+            if (auto_mode) {
+                // Controlul automat al releului cu pragul selectat
+                auto_relay_control(temp, active_threshold);
+            }
         } else {
             temperatura_valida = false;
             printf("EROARE: Senzorul DS18B20 nu raspunde!\n");
+            oled_needs_update = true;
         }
 
         // Pauza de 2 secunde intre citiri
-        for (int i = 0; i < 20 && auto_mode; i++) {
-            sleep_ms(100); 
-        }
+        sleep_ms(2000);
     }
 }
 
@@ -149,6 +162,7 @@ void set_relay_callback(bool on) {
     relay_state = on;
     gpio_put(RELAY_PIN, on ? 0 : 1);  // Active-LOW: 0 = relay ON
     printf("[HTTP] Releu setat: %s\n", on ? "ON" : "OFF");
+    oled_needs_update = true;
 }
 
 void set_mode_callback(bool auto_on) {
@@ -163,8 +177,8 @@ void set_mode_callback(bool auto_on) {
         gpio_put(LED_PIN_AUTO, 0);
         relay_state = false;
         gpio_put(RELAY_PIN, 1); // Oprim releul la revenirea in manual
-        temperatura_valida = false;
     }
+    oled_needs_update = true;
 }
 
 // Core principal, butoane
@@ -245,7 +259,7 @@ int main() {
             ssd1306_render(&oled);
 
             int wifi_err = cyw43_arch_wifi_connect_timeout_ms(
-                WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK, 30000
+                WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK, 10000
             );
 
             if (wifi_err == 0) {
@@ -255,6 +269,10 @@ int main() {
                 char ip_str[20];
                 snprintf(ip_str, sizeof(ip_str), "%s", ip4addr_ntoa(netif_ip4_addr(n)));
                 printf("[WIFI] Conectat! IP: %s\n", ip_str);
+
+                // Salvam IP-ul in variabila globala
+                snprintf(global_ip_str, sizeof(global_ip_str), "IP:%s", ip_str);
+                wifi_connected = true;
 
                 // Afisam IP-ul pe OLED
                 ssd1306_clear(&oled);
@@ -295,7 +313,7 @@ int main() {
             .light_threshold   = &light_threshold,
             .set_relay         = set_relay_callback,
             .set_mode          = set_mode_callback,
-            .update_display    = oled_update_display,
+            .update_display    = trigger_oled_update,
         };
         if (http_server_init(&http_state)) {
             printf("[HTTP] Server pornit pe portul 80\n");
@@ -329,11 +347,10 @@ int main() {
                     
                     relay_state = false;
                     gpio_put(RELAY_PIN, 1); // Oprim releul la revenirea in manual
-                    temperatura_valida = false;
                 }
 
                 // Actualizam OLED-ul cu noul mod
-                oled_update_display();
+                oled_needs_update = true;
 
                 // Asteptam eliberarea butonului
                 while (!gpio_get(BTN_MODE_PIN)) {
@@ -355,7 +372,7 @@ int main() {
                         gpio_put(RELAY_PIN, 1); // Active-LOW: 1 = relay OFF
                     }
                     printf("BTN_RELAY: apasat -> Releu = %s (manual)\n", relay_state ? "ON" : "OFF");
-                    oled_update_display(); // Actualizam status releu pe OLED
+                    oled_needs_update = true; // Actualizam status releu pe OLED
                 } else {
                     // In modul auto, butonul schimba threshold-ul activ (zi sau noapte)
                     if (is_daytime) {
@@ -365,7 +382,7 @@ int main() {
                         temp_threshold_night = change_temp(temp_threshold_night);
                         printf("THRESHOLD NOAPTE: schimbat -> %.1f°C\n", temp_threshold_night);
                     }
-                    oled_update_display();
+                    oled_needs_update = true;
                 }
 
                 // Asteptam eliberarea butonului
@@ -374,6 +391,11 @@ int main() {
                 }
                 sleep_ms(50);
             }
+        }
+
+        if (oled_needs_update) {
+            oled_update_display();
+            oled_needs_update = false;
         }
 
         sleep_ms(10);
