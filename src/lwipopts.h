@@ -1,12 +1,9 @@
 #ifndef _LWIPOPTS_H
 #define _LWIPOPTS_H
 
-// ═══════════════════════════════════════════════════════
-// Configurare lwIP pentru Pico 2W — HTTP Server
-// Folosim modul NO_SYS (fara OS) cu threadsafe_background
-// ═══════════════════════════════════════════════════════
 
-// Mod bare-metal (fara RTOS)
+
+// Mod bare-metal
 #define NO_SYS                      1
 #define LWIP_SOCKET                 0
 #define LWIP_NETCONN                0

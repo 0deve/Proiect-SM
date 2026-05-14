@@ -18,6 +18,7 @@ target_link_libraries(smart_home_gateway
     hardware_gpio               # control gpio (relay, led, butoane)
     hardware_i2c                # comunicatie i2c (oled ssd1306)
     hardware_adc                # citire adc (senzor lumina)
+    hardware_dma                # transfer dma pentru adc
     pico_sync                   # mutex pentru sincronizare intre core-uri
     pico_cyw43_arch_lwip_threadsafe_background  # wifi + lwip (server http)
 )

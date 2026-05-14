@@ -111,7 +111,6 @@ static void handle_request(struct tcp_pcb *pcb, const char *request) {
     }
 }
 
-// ── Callbacks TCP lwIP ──
 static err_t http_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
     if (p == NULL) {
         // Conexiune inchisa de client
